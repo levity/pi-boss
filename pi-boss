@@ -7,7 +7,8 @@ Usage:
     echo "build a web scraper" | pi-boss       # Same, via stdin
     pi-boss status                             # Show all managed sessions
     pi-boss status <pattern>                   # Filter to matching sessions
-    pi-boss kill <pattern>                     # Kill running sessions matching pattern
+    pi-boss dump <pattern>                     # Dump session transcript
+    pi-boss stop <pattern>                     # Cancel a running session
 
 Options:
     --group <id>              Group ID for supersede behavior (see below).
@@ -31,9 +32,6 @@ Concurrency & safety:
 
     Cancelled sessions show status "cancelled" in pi-boss status. Workers
     check for cancellation and abort their pi instance promptly.
-
-Internal:
-    pi-boss --worker <session-dir>             # Runs a pi RPC worker (backgrounded)
 """
 
 import sys
@@ -518,39 +516,56 @@ def start_task(slug, task, group=None):
 # Status display
 # ---------------------------------------------------------------------------
 
-STATUS_ICONS = {
-    'running': '🔄',
-    'done': '✅',
-    'error': '❌',
-    'dead': '💀',
-    'starting': '⏳',
-    'cancelled': '🚫',
-    'killed': '🔪',
-    'unknown': '❓',
-}
-
-def print_status(pattern=None):
-    """Print status of all (or matching) sessions."""
+def print_status(pattern=None, as_json=False, full=False):
+    """Print status of all (or matching) sessions, newest first."""
     sessions = get_all_sessions()
+    sessions.reverse()  # newest first
 
     if pattern:
         sessions = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
+
+    if as_json:
+        out = []
+        for s in sessions:
+            status = get_session_status(s)
+            entry = {
+                "name": s.get('_name'),
+                "task": s.get('task'),
+                "status": status,
+                "pid": s.get('pid'),
+                "started_at": s.get('started_at'),
+                "finished_at": s.get('finished_at'),
+                "elapsed": elapsed_str(s.get('started_at', '')),
+            }
+            if s.get('group'):
+                entry["group"] = s['group']
+            if status != 'cancelled':
+                last_tool = get_last_tool_activity(s['_dir'])
+                if last_tool:
+                    entry["last_tool"] = last_tool
+                last_text = get_last_assistant_text(s['_dir'])
+                if last_text:
+                    entry["last_response"] = last_text
+            out.append(entry)
+        print(json.dumps(out, indent=2))
+        return
 
     if not sessions:
         print(f"No sessions matching '{pattern}'." if pattern else "No sessions found.")
         return
 
+    t = (lambda text, n: text) if full else truncate
+
     for s in sessions:
         status = get_session_status(s)
-        icon = STATUS_ICONS.get(status, '❓')
         elapsed = elapsed_str(s.get('started_at', ''))
         name = s.get('_name', '?')
         task = s.get('task', '?')
         pid = s.get('pid', '?')
         group = s.get('group', '')
 
-        print(f"{icon} {name}")
-        print(f"   Task: {task}")
+        print(name)
+        print(f"   Task: {t(task, 100)}")
         status_line = f"   Status: {status} | PID: {pid} | Elapsed: {elapsed}"
         if group:
             status_line += f" | Group: {group}"
@@ -562,41 +577,82 @@ def print_status(pattern=None):
 
         last_tool = get_last_tool_activity(s['_dir'])
         if last_tool:
-            print(f"   Last tool: {truncate(last_tool, 120)}")
+            print(f"   Last tool: {t(last_tool, 120)}")
 
         last_text = get_last_assistant_text(s['_dir'])
         if last_text:
-            print(f"   Last response: {truncate(last_text, 200)}")
+            print(f"   Last response: {t(last_text, 200)}")
 
         print()
 
 # ---------------------------------------------------------------------------
-# Kill a session
+# Dump session events
 # ---------------------------------------------------------------------------
 
-def kill_session(pattern):
-    """Kill running sessions matching a pattern."""
+def find_session_jsonl(session_dir):
+    """Find pi's session JSONL file (not events.jsonl or meta.json)."""
+    session_dir = Path(session_dir)
+    for f in sorted(session_dir.glob("*.jsonl")):
+        if f.name == "events.jsonl":
+            continue
+        return f
+    return None
+
+def dump_session(pattern):
+    """Dump pi's session JSONL for the matching session."""
     sessions = get_all_sessions()
     matched = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
 
     if not matched:
-        print(f"No sessions matching '{pattern}'.")
+        print(f"No sessions matching '{pattern}'.", file=sys.stderr)
+        sys.exit(1)
+
+    if len(matched) > 1:
+        print(f"Multiple sessions match '{pattern}':", file=sys.stderr)
+        for s in matched:
+            print(f"  {s['_name']}", file=sys.stderr)
+        sys.exit(1)
+
+    session_file = find_session_jsonl(matched[0]['_dir'])
+    if not session_file:
+        print(f"No session file in {matched[0]['_name']}.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(session_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                print(line)
+
+# ---------------------------------------------------------------------------
+# Stop a session
+# ---------------------------------------------------------------------------
+
+def stop_session(pattern):
+    """Stop a running session matching the pattern."""
+    sessions = get_all_sessions()
+    matched = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
+
+    if not matched:
+        print(f"No sessions matching '{pattern}'.", file=sys.stderr)
+        sys.exit(1)
+
+    if len(matched) > 1:
+        print(f"Multiple sessions match '{pattern}':", file=sys.stderr)
+        for s in matched:
+            print(f"  {s['_name']}", file=sys.stderr)
+        sys.exit(1)
+
+    s = matched[0]
+    status = get_session_status(s)
+    name = s.get('_name', '?')
+
+    if status not in ('running', 'starting'):
+        print(f"{name}: not running ({status})")
         return
 
-    for s in matched:
-        status = get_session_status(s)
-        name = s.get('_name', '?')
-        if status not in ('running', 'starting'):
-            print(f"  {name}: not running ({status}), skipping")
-            continue
-
-        cancel_session_processes(s, s['_dir'])
-        # Re-mark as killed (not cancelled) for explicit kill
-        meta = load_meta(s['_dir'])
-        if meta:
-            meta['status'] = 'killed'
-            save_meta(s['_dir'], meta)
-        print(f"  {name}: killed")
+    cancel_session_processes(s, s['_dir'])
+    print(f"{name}: stopped")
 
 # ---------------------------------------------------------------------------
 # Main instruction handler
@@ -697,6 +753,8 @@ def parse_args(argv):
     opts = {
         'group': None,
         'debounce': DEFAULT_DEBOUNCE_SECS,
+        'json': False,
+        'full': False,
     }
     rest = []
     i = 0
@@ -715,7 +773,15 @@ def parse_args(argv):
             opts['debounce'] = float(argv[i + 1])
             i += 2
             continue
-        elif arg in ('status', 'kill', 'help') and command is None and not rest:
+        elif arg == '--json':
+            opts['json'] = True
+            i += 1
+            continue
+        elif arg == '--full':
+            opts['full'] = True
+            i += 1
+            continue
+        elif arg in ('status', 'dump', 'stop', 'help') and command is None and not rest:
             command = arg
         elif arg in ('--help', '-h') and command is None and not rest:
             command = 'help'
@@ -738,14 +804,21 @@ def main():
 
     if command == 'status':
         pattern = rest[0] if rest else None
-        print_status(pattern)
+        print_status(pattern, as_json=opts['json'], full=opts['full'])
         return
 
-    if command == 'kill':
+    if command == 'dump':
         if not rest:
-            print("Usage: pi-boss kill <pattern>", file=sys.stderr)
+            print("Usage: pi-boss dump <pattern>", file=sys.stderr)
             sys.exit(1)
-        kill_session(rest[0])
+        dump_session(rest[0])
+        return
+
+    if command == 'stop':
+        if not rest:
+            print("Usage: pi-boss stop <pattern>", file=sys.stderr)
+            sys.exit(1)
+        stop_session(rest[0])
         return
 
     if command == 'help':
