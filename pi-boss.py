@@ -58,15 +58,17 @@ from pathlib import Path
 
 BOSS_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BOSS_DIR / "sessions"
-GATEWAY_URL = "http://169.254.169.254/gateway/llm/_/gateway/anthropic/v1/messages"
-BOSS_MODEL = "claude-sonnet-4-20250514"
 BOSS_MAX_TOKENS = 1024
 DEFAULT_DEBOUNCE_SECS = 5
 
-# Title generation via OpenRouter (or any OpenAI-compatible endpoint).
-# Configured via .env file in BOSS_DIR: OPENROUTER_API_KEY, OPENROUTER_MODEL
-DEFAULT_TITLE_MODEL = "moonshotai/kimi-k2.5"
+# All LLM calls go through OpenRouter.
+# Configured via .env file in BOSS_DIR:
+#   OPENROUTER_API_KEY          — required
+#   OPENROUTER_SMART_MODEL      — boss brain (default: anthropic/claude-haiku-4.5)
+#   OPENROUTER_CHEAP_MODEL      — title generation (default: google/gemma-3-27b-it)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_SMART_MODEL = "anthropic/claude-haiku-4.5"
+DEFAULT_CHEAP_MODEL = "google/gemma-3-27b-it"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -249,7 +251,7 @@ def fallback_title(task):
 def generate_title(task, model=None):
     """Call OpenRouter to generate a concise session title (2-5 words)."""
     env = load_dot_env()
-    llm_model = model or env.get('OPENROUTER_MODEL') or DEFAULT_TITLE_MODEL
+    llm_model = model or env.get('OPENROUTER_CHEAP_MODEL') or DEFAULT_CHEAP_MODEL
 
     client = get_openai_client()
     if not client:
@@ -400,37 +402,24 @@ def cancel_young_sessions(debounce_secs, group=None):
 # ---------------------------------------------------------------------------
 
 def call_boss_llm(system_prompt, user_message):
-    """Call the Anthropic gateway for boss brain decisions."""
-    import urllib.request
+    """Call OpenRouter for boss brain decisions."""
+    env = load_dot_env()
+    llm_model = env.get('OPENROUTER_SMART_MODEL') or DEFAULT_SMART_MODEL
 
-    payload = json.dumps({
-        "model": BOSS_MODEL,
-        "max_tokens": BOSS_MAX_TOKENS,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}]
-    }).encode()
+    client = get_openai_client()
+    if not client:
+        raise RuntimeError("No OPENROUTER_API_KEY in .env")
 
-    req = urllib.request.Request(
-        GATEWAY_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "Accept-Encoding": "identity",
-        }
+    resp = client.chat.completions.create(
+        model=llm_model,
+        max_tokens=BOSS_MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        timeout=30,
     )
-
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw_bytes = resp.read()
-        if raw_bytes[:2] == b'\x1f\x8b':
-            import gzip
-            raw_bytes = gzip.decompress(raw_bytes)
-        data = json.loads(raw_bytes)
-
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            return block["text"]
-    return ""
+    return (resp.choices[0].message.content or "").strip()
 
 def build_sessions_context():
     """Build a text summary of all sessions for the boss brain."""
