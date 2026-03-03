@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 # Wrapper: runs pi-boss.py via uv (manages inline dependencies automatically).
-exec uv run "$(dirname "$0")/pi-boss.py" "$@"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec uv run "$SCRIPT_DIR/pi-boss.py" "$@"
