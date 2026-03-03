@@ -9,10 +9,12 @@ Usage:
     pi-boss status <pattern>                   # Filter to matching sessions
     pi-boss dump <pattern>                     # Dump session transcript
     pi-boss stop <pattern>                     # Cancel a running session
+    pi-boss append <pattern> "more instructions"  # Continue an existing session with new input
 
 Options:
     --group <id>              Group ID for supersede behavior (see below).
     --debounce <seconds>      Debounce window in seconds (default: 5, 0 to disable).
+    --llm <model>             Model for title generation (default: gpt-4o-mini).
 
 Concurrency & safety:
 
@@ -56,6 +58,10 @@ GATEWAY_URL = "http://169.254.169.254/gateway/llm/_/gateway/anthropic/v1/message
 BOSS_MODEL = "claude-sonnet-4-20250514"
 BOSS_MAX_TOKENS = 1024
 DEFAULT_DEBOUNCE_SECS = 5
+
+# Title generation uses the OpenAI-compatible gateway (cheaper models available).
+TITLE_GATEWAY_URL = "http://169.254.169.254/gateway/llm/_/gateway/openai/v1/chat/completions"
+DEFAULT_TITLE_MODEL = "gpt-4o-mini"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -203,6 +209,73 @@ def get_last_tool_activity(session_dir):
     except Exception:
         pass
     return last_tool
+
+def fallback_title(task):
+    """Return the first 50 characters of the task as a fallback title."""
+    if not task:
+        return "Untitled"
+    if len(task) <= 50:
+        return task
+    return task[:50].rstrip() + "…"
+
+def generate_title(task, model=None):
+    """Call the LLM gateway to generate a concise session title (2-5 words)."""
+    import urllib.request
+
+    llm_model = model or DEFAULT_TITLE_MODEL
+    payload = json.dumps({
+        "model": llm_model,
+        "max_tokens": 30,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Generate a concise title (2-5 words) for a coding session "
+                "with this task. Reply with ONLY the title, no quotes or "
+                f"punctuation.\n\nTask: {task}"
+            ),
+        }],
+    }).encode()
+
+    req = urllib.request.Request(
+        TITLE_GATEWAY_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept-Encoding": "identity",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw_bytes = resp.read()
+            if raw_bytes[:2] == b'\x1f\x8b':
+                import gzip
+                raw_bytes = gzip.decompress(raw_bytes)
+            data = json.loads(raw_bytes)
+
+        text = data["choices"][0]["message"]["content"].strip()
+        return text if text else fallback_title(task)
+    except Exception as e:
+        print(f"Title generation failed: {e}", file=sys.stderr)
+        return fallback_title(task)
+
+def ensure_title(session_dir, meta, model=None):
+    """Ensure a session has a title, generating one if needed. Returns the title."""
+    # Already cached
+    if meta.get('title'):
+        return meta['title']
+
+    # Don't generate for sessions still starting
+    status = get_session_status(meta)
+    if status == 'starting':
+        return fallback_title(meta.get('task', ''))
+
+    # Generate and cache
+    task = meta.get('task', '')
+    title = generate_title(task, model=model)
+    meta['title'] = title
+    save_meta(session_dir, meta)
+    return title
 
 def elapsed_str(started_at):
     """Human-readable elapsed time from ISO timestamp."""
@@ -385,33 +458,42 @@ def run_worker(session_dir):
     if meta.get('status') == 'cancelled':
         sys.exit(0)
 
-    task = meta['task']
+    prompt = meta.get('prompt') or meta['task']
     events_path = session_dir / "events.jsonl"
 
+    pi_cmd = [
+        "pi", "--mode", "rpc",
+        "--session-dir", str(session_dir),
+        "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
+    ]
+
+    # If resuming, point pi at the existing session file
+    session_file = find_session_jsonl(session_dir)
+    if meta.get('resuming') and session_file:
+        pi_cmd.extend(["--session", str(session_file)])
+
     proc = subprocess.Popen(
-        [
-            "pi", "--mode", "rpc",
-            "--session-dir", str(session_dir),
-            "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
-        ],
+        pi_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=open(session_dir / "stderr.log", 'w'),
+        stderr=open(session_dir / "stderr.log", 'a'),
         text=True,
         bufsize=1,
     )
 
     meta['pid'] = proc.pid
     meta['status'] = 'running'
+    for key in ('prompt', 'resuming'):
+        meta.pop(key, None)  # consumed; don't re-send on next restart
     save_meta(session_dir, meta)
 
-    prompt_cmd = json.dumps({"type": "prompt", "message": task})
+    prompt_cmd = json.dumps({"type": "prompt", "message": prompt})
     proc.stdin.write(prompt_cmd + "\n")
     proc.stdin.flush()
 
     agent_done = False
     try:
-        with open(events_path, 'w') as ef:
+        with open(events_path, 'a') as ef:
             for line in proc.stdout:
                 # Check if we've been cancelled mid-run
                 current_meta = load_meta(session_dir)
@@ -516,7 +598,7 @@ def start_task(slug, task, group=None):
 # Status display
 # ---------------------------------------------------------------------------
 
-def print_status(pattern=None, as_json=False, full=False):
+def print_status(pattern=None, as_json=False, full=False, llm_model=None):
     """Print status of all (or matching) sessions, newest first."""
     sessions = get_all_sessions()
     sessions.reverse()  # newest first
@@ -528,9 +610,11 @@ def print_status(pattern=None, as_json=False, full=False):
         out = []
         for s in sessions:
             status = get_session_status(s)
+            title = ensure_title(s['_dir'], s, model=llm_model)
             entry = {
                 "name": s.get('_name'),
                 "task": s.get('task'),
+                "title": title,
                 "status": status,
                 "pid": s.get('pid'),
                 "started_at": s.get('started_at'),
@@ -561,10 +645,11 @@ def print_status(pattern=None, as_json=False, full=False):
         elapsed = elapsed_str(s.get('started_at', ''))
         name = s.get('_name', '?')
         task = s.get('task', '?')
+        title = ensure_title(s['_dir'], s, model=llm_model)
         pid = s.get('pid', '?')
         group = s.get('group', '')
 
-        print(name)
+        print(f"{name}  [{title}]")
         print(f"   Task: {t(task, 100)}")
         status_line = f"   Status: {status} | PID: {pid} | Elapsed: {elapsed}"
         if group:
@@ -653,6 +738,57 @@ def stop_session(pattern):
 
     cancel_session_processes(s, s['_dir'])
     print(f"{name}: stopped")
+
+# ---------------------------------------------------------------------------
+# Append to a session
+# ---------------------------------------------------------------------------
+
+def append_session(pattern, instruction):
+    """Resume an existing session with a new instruction."""
+    sessions = get_all_sessions()
+    matched = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
+
+    if not matched:
+        print(f"No sessions matching '{pattern}'.", file=sys.stderr)
+        sys.exit(1)
+
+    if len(matched) > 1:
+        print(f"Multiple sessions match '{pattern}':", file=sys.stderr)
+        for s in matched:
+            print(f"  {s['_name']}", file=sys.stderr)
+        sys.exit(1)
+
+    s = matched[0]
+    name = s.get('_name', '?')
+    status = get_session_status(s)
+    session_dir = s['_dir']
+
+    if status in ('running', 'starting'):
+        print(f"{name}: still running, stop it first", file=sys.stderr)
+        sys.exit(1)
+
+    # Set the prompt and resuming flag for the worker to pick up
+    meta = load_meta(session_dir)
+    meta['prompt'] = instruction
+    meta['resuming'] = True
+    meta['status'] = 'starting'
+    meta['finished_at'] = None
+    meta['exit_code'] = None
+    save_meta(session_dir, meta)
+
+    worker_cmd = [sys.executable, __file__, "--worker", str(session_dir)]
+    proc = subprocess.Popen(
+        worker_cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=open(Path(session_dir) / "worker_stdout.log", 'a'),
+        stderr=open(Path(session_dir) / "worker_stderr.log", 'a'),
+        start_new_session=True,
+    )
+
+    meta['worker_pid'] = proc.pid
+    save_meta(session_dir, meta)
+
+    print(f"{name}: appended, resuming")
 
 # ---------------------------------------------------------------------------
 # Main instruction handler
@@ -755,6 +891,7 @@ def parse_args(argv):
         'debounce': DEFAULT_DEBOUNCE_SECS,
         'json': False,
         'full': False,
+        'llm': None,
     }
     rest = []
     i = 0
@@ -781,7 +918,11 @@ def parse_args(argv):
             opts['full'] = True
             i += 1
             continue
-        elif arg in ('status', 'dump', 'stop', 'help') and command is None and not rest:
+        elif arg == '--llm' and i + 1 < len(argv):
+            opts['llm'] = argv[i + 1]
+            i += 2
+            continue
+        elif arg in ('status', 'dump', 'stop', 'append', 'help') and command is None and not rest:
             command = arg
         elif arg in ('--help', '-h') and command is None and not rest:
             command = 'help'
@@ -804,7 +945,7 @@ def main():
 
     if command == 'status':
         pattern = rest[0] if rest else None
-        print_status(pattern, as_json=opts['json'], full=opts['full'])
+        print_status(pattern, as_json=opts['json'], full=opts['full'], llm_model=opts['llm'])
         return
 
     if command == 'dump':
@@ -819,6 +960,13 @@ def main():
             print("Usage: pi-boss stop <pattern>", file=sys.stderr)
             sys.exit(1)
         stop_session(rest[0])
+        return
+
+    if command == 'append':
+        if len(rest) < 2:
+            print("Usage: pi-boss append <pattern> \"instructions\"", file=sys.stderr)
+            sys.exit(1)
+        append_session(rest[0], ' '.join(rest[1:]))
         return
 
     if command == 'help':
