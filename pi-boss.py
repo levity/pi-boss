@@ -265,7 +265,7 @@ def generate_title(task, model=None):
             messages=[{
                 "role": "user",
                 "content": (
-                    "Write a single short title (2-5 words) for this coding task. "
+                    "Write a single short title (3-7 words) for this coding task. "
                     "Output ONLY one title on one line. No alternatives, no list, "
                     f"no quotes, no punctuation.\n\nTask: {task}"
                 ),
