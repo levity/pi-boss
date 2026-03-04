@@ -19,6 +19,7 @@ Options:
     --group <id>              Group ID for supersede behavior (see below).
     --debounce <seconds>      Debounce window in seconds (default: 5, 0 to disable).
     --llm <model>             Model for title generation (default: gpt-4o-mini).
+    --cwd <dir>               Working directory for the pi session.
 
 Concurrency & safety:
 
@@ -479,11 +480,14 @@ def run_worker(session_dir):
     if meta.get('resuming') and session_file:
         pi_cmd.extend(["--session", str(session_file)])
 
+    work_dir = meta.get('cwd') or str(BOSS_DIR)
+
     proc = subprocess.Popen(
         pi_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=open(session_dir / "stderr.log", 'a'),
+        cwd=work_dir,
         text=True,
         bufsize=1,
     )
@@ -567,7 +571,7 @@ def run_worker(session_dir):
 # Start a new task
 # ---------------------------------------------------------------------------
 
-def start_task(slug, task, group=None):
+def start_task(slug, task, group=None, cwd=None):
     """Create a session and launch a background worker."""
     session_name = f"{now_stamp()}-{slug}"
     session_dir = SESSIONS_DIR / session_name
@@ -586,6 +590,8 @@ def start_task(slug, task, group=None):
     }
     if group:
         meta["group"] = group
+    if cwd:
+        meta["cwd"] = str(Path(cwd).resolve())
     save_meta(session_dir, meta)
 
     worker_cmd = ["uv", "run", __file__, "--worker", str(session_dir)]
@@ -841,7 +847,7 @@ Rules:
 - The "response" field will be spoken aloud via text-to-speech. Write it as natural, conversational speech. No bullet points, numbered lists, markdown, bold, italic, backticks, code fences, or other visual formatting. Use plain sentences and short paragraphs. Paths and filenames can be written normally. Prefer brevity — one to three sentences is ideal.
 """
 
-def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_SECS):
+def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_SECS, cwd=None):
     """Use the boss brain to interpret an instruction and act on it.
 
     Acquires the session lock, cancels stale/superseded sessions, then
@@ -880,7 +886,7 @@ def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_S
         if action == 'start':
             slug = slugify(decision.get('slug', 'task'))
             prompt = decision.get('prompt', instruction)
-            session_name = start_task(slug, prompt, group=group)
+            session_name = start_task(slug, prompt, group=group, cwd=cwd)
             print(response)
             print(f"\n📂 Session: {session_name}")
 
@@ -904,6 +910,7 @@ def parse_args(argv):
         'full': False,
         'limit': None,
         'llm': None,
+        'cwd': None,
     }
     rest = []
     i = 0
@@ -936,6 +943,10 @@ def parse_args(argv):
             continue
         elif arg == '--llm' and i + 1 < len(argv):
             opts['llm'] = argv[i + 1]
+            i += 2
+            continue
+        elif arg == '--cwd' and i + 1 < len(argv):
+            opts['cwd'] = argv[i + 1]
             i += 2
             continue
         elif arg in ('status', 'dump', 'stop', 'append', 'help') and command is None and not rest:
@@ -998,7 +1009,7 @@ def main():
         print(__doc__.strip())
         sys.exit(1)
 
-    handle_instruction(instruction, group=opts['group'], debounce_secs=opts['debounce'])
+    handle_instruction(instruction, group=opts['group'], debounce_secs=opts['debounce'], cwd=opts['cwd'])
 
 if __name__ == '__main__':
     main()
