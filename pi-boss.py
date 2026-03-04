@@ -130,10 +130,37 @@ def get_all_sessions():
                 sessions.append(meta)
     return sessions
 
+def _read_tail(path, max_bytes=4096):
+    """Read the last max_bytes of a file, or empty string if missing."""
+    try:
+        p = Path(path)
+        size = p.stat().st_size
+        with open(p) as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # skip partial line
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+def _finalize_dead_session(meta):
+    """Capture error output from log files into meta for a dead session."""
+    session_dir = Path(meta['_dir'])
+    error_parts = []
+    for log_name in ('worker_error.log', 'worker_stderr.log', 'stderr.log'):
+        content = _read_tail(session_dir / log_name)
+        if content:
+            error_parts.append(f"--- {log_name} ---\n{content}")
+    if error_parts:
+        meta['error_output'] = "\n\n".join(error_parts)
+    meta['status'] = 'dead'
+    meta['finished_at'] = meta.get('finished_at') or now_iso()
+    save_meta(session_dir, meta)
+
 def get_session_status(meta):
     """Determine actual status of a session (running/done/dead)."""
     recorded = meta.get('status', 'unknown')
-    if recorded in ('done', 'killed', 'cancelled'):
+    if recorded in ('done', 'killed', 'cancelled', 'dead'):
         return recorded
     pid = meta.get('pid')
     worker_pid = meta.get('worker_pid')
@@ -143,6 +170,7 @@ def get_session_status(meta):
     if worker_pid and pid_alive(worker_pid):
         return 'starting'
     if recorded in ('running', 'starting'):
+        _finalize_dead_session(meta)
         return 'dead'
     return recorded
 
@@ -442,6 +470,8 @@ def build_sessions_context():
         lines.append(f"SESSION: {name}")
         lines.append(f"  Status: {status} | Elapsed: {elapsed}")
         lines.append(f"  Task: {task}")
+        if s.get('error_output'):
+            lines.append(f"  Error: {truncate(s['error_output'], 300)}")
         if last_tool:
             lines.append(f"  Last tool: {truncate(last_tool, 200)}")
         if last_text:
@@ -612,7 +642,7 @@ def start_task(slug, task, group=None, cwd=None):
 # Status display
 # ---------------------------------------------------------------------------
 
-def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=None):
+def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=None, offset=None):
     """Print status of all (or matching) sessions, newest first."""
     sessions = get_all_sessions()
     sessions.reverse()  # newest first
@@ -620,6 +650,11 @@ def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=
     if pattern:
         sessions = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
 
+    total = len(sessions)
+
+    # Apply offset then limit (both operate on the newest-first list).
+    if offset is not None and offset > 0:
+        sessions = sessions[offset:]
     if limit is not None:
         sessions = sessions[:limit]
 
@@ -640,6 +675,8 @@ def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=
             }
             if s.get('group'):
                 entry["group"] = s['group']
+            if s.get('error_output'):
+                entry["error_output"] = s['error_output']
             if status != 'cancelled':
                 last_tool = get_last_tool_activity(s['_dir'])
                 if last_tool:
@@ -648,7 +685,12 @@ def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=
                 if last_text:
                     entry["last_response"] = last_text
             out.append(entry)
-        print(json.dumps(out, indent=2))
+        # When offset or limit is used, wrap output with total count metadata
+        # so callers can paginate without a separate count query.
+        if offset is not None or limit is not None:
+            print(json.dumps({"total": total, "sessions": out}, indent=2))
+        else:
+            print(json.dumps(out, indent=2))
         return
 
     if not sessions:
@@ -676,6 +718,9 @@ def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=
         if status == 'cancelled':
             print()
             continue
+
+        if s.get('error_output'):
+            print(f"   Error: {t(s['error_output'], 200)}")
 
         last_tool = get_last_tool_activity(s['_dir'])
         if last_tool:
@@ -909,6 +954,7 @@ def parse_args(argv):
         'json': False,
         'full': False,
         'limit': None,
+        'offset': None,
         'llm': None,
         'cwd': None,
     }
@@ -939,6 +985,10 @@ def parse_args(argv):
             continue
         elif arg == '--limit' and i + 1 < len(argv):
             opts['limit'] = int(argv[i + 1])
+            i += 2
+            continue
+        elif arg == '--offset' and i + 1 < len(argv):
+            opts['offset'] = int(argv[i + 1])
             i += 2
             continue
         elif arg == '--llm' and i + 1 < len(argv):
@@ -972,7 +1022,7 @@ def main():
 
     if command == 'status':
         pattern = rest[0] if rest else None
-        print_status(pattern, as_json=opts['json'], full=opts['full'], llm_model=opts['llm'], limit=opts['limit'])
+        print_status(pattern, as_json=opts['json'], full=opts['full'], llm_model=opts['llm'], limit=opts['limit'], offset=opts['offset'])
         return
 
     if command == 'dump':
