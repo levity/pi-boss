@@ -606,13 +606,16 @@ def start_task(slug, task, group=None):
 # Status display
 # ---------------------------------------------------------------------------
 
-def print_status(pattern=None, as_json=False, full=False, llm_model=None):
+def print_status(pattern=None, as_json=False, full=False, llm_model=None, limit=None):
     """Print status of all (or matching) sessions, newest first."""
     sessions = get_all_sessions()
     sessions.reverse()  # newest first
 
     if pattern:
         sessions = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
+
+    if limit is not None:
+        sessions = sessions[:limit]
 
     if as_json:
         out = []
@@ -899,6 +902,7 @@ def parse_args(argv):
         'debounce': DEFAULT_DEBOUNCE_SECS,
         'json': False,
         'full': False,
+        'limit': None,
         'llm': None,
     }
     rest = []
@@ -925,6 +929,10 @@ def parse_args(argv):
         elif arg == '--full':
             opts['full'] = True
             i += 1
+            continue
+        elif arg == '--limit' and i + 1 < len(argv):
+            opts['limit'] = int(argv[i + 1])
+            i += 2
             continue
         elif arg == '--llm' and i + 1 < len(argv):
             opts['llm'] = argv[i + 1]
@@ -953,7 +961,7 @@ def main():
 
     if command == 'status':
         pattern = rest[0] if rest else None
-        print_status(pattern, as_json=opts['json'], full=opts['full'], llm_model=opts['llm'])
+        print_status(pattern, as_json=opts['json'], full=opts['full'], llm_model=opts['llm'], limit=opts['limit'])
         return
 
     if command == 'dump':
