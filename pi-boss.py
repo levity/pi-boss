@@ -449,39 +449,10 @@ def call_boss_llm(system_prompt, user_message):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
+        response_format={"type": "json_object"},
         timeout=30,
     )
     return (resp.choices[0].message.content or "").strip()
-
-def build_sessions_context():
-    """Build a text summary of all sessions for the boss brain."""
-    sessions = get_all_sessions()
-    if not sessions:
-        return "No active or past sessions."
-
-    lines = []
-    for s in sessions:
-        status = get_session_status(s)
-        if status == 'cancelled':
-            continue  # Don't clutter context with cancelled sessions
-        elapsed = elapsed_str(s.get('started_at', ''))
-        task = s.get('task', '?')
-        name = s.get('_name', '?')
-        last_text = get_last_assistant_text(s['_dir'])
-        last_tool = get_last_tool_activity(s['_dir'])
-
-        lines.append(f"SESSION: {name}")
-        lines.append(f"  Status: {status} | Elapsed: {elapsed}")
-        lines.append(f"  Task: {task}")
-        if s.get('error_output'):
-            lines.append(f"  Error: {truncate(s['error_output'], 300)}")
-        if last_tool:
-            lines.append(f"  Last tool: {truncate(last_tool, 200)}")
-        if last_text:
-            lines.append(f"  Last response: {truncate(last_text, 300)}")
-        lines.append("")
-
-    return "\n".join(lines) if lines else "No active or past sessions."
 
 # ---------------------------------------------------------------------------
 # Worker mode (backgrounded, manages one pi instance)
@@ -860,37 +831,20 @@ def append_session(pattern, instruction):
 # ---------------------------------------------------------------------------
 
 BOSS_SYSTEM_PROMPT = """\
-You are pi-boss, a dispatcher that manages coding agent instances.
+You are pi-boss, a dispatcher that routes tasks to coding agent instances.
+You are a DISPATCHER — you never do coding work yourself. Your only job is to prepare a task for a coding agent.
 
-You receive user instructions and decide what to do. You have two actions:
+Your entire response must be a single JSON object (no markdown fencing, no preamble, no explanation outside the JSON):
 
-1. START a new task — spin up a new pi coding agent to do work.
-2. REPORT on existing work — summarize status of running/completed tasks.
-
-Current sessions:
-{sessions_context}
-
-Respond with a JSON object (no markdown fencing):
-
-For starting a new task:
 {{
-  "action": "start",
   "slug": "short-kebab-case-slug",
   "prompt": "the detailed instruction to give to the pi coding agent",
   "response": "brief acknowledgment to the user about what you're starting"
 }}
 
-For reporting on existing work:
-{{
-  "action": "report",
-  "response": "your summary/answer about the existing work"
-}}
-
 Rules:
 - The slug should be 2-4 words, descriptive, kebab-case, max 30 chars.
 - The prompt should be a clear, complete instruction for the coding agent. Expand on the user's request if needed — the agent has full access to read, write, edit files and run bash commands.
-- If the user asks about status/progress of existing work, use the session info to answer.
-- If ambiguous, prefer starting a new task.
 - Always include a brief, friendly "response" for the user.
 - The "response" field will be spoken aloud via text-to-speech. Write it as natural, conversational speech. No bullet points, numbered lists, markdown, bold, italic, backticks, code fences, or other visual formatting. Use plain sentences and short paragraphs. Paths and filenames can be written normally. Prefer brevity — one to three sentences is ideal.
 """
@@ -899,9 +853,9 @@ def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_S
     """Dispatch an instruction to a new pi session.
 
     Acquires the session lock, cancels stale/superseded sessions, then
-    routes through the boss LLM to decide start vs report. The instruction
-    is passed verbatim to pi unless --refine is set, in which case the
-    boss LLM's expanded prompt is used instead.
+    asks the boss LLM to prepare a slug/prompt/response for the task.
+    The instruction is passed verbatim to pi unless --refine is set,
+    in which case the boss LLM's expanded prompt is used instead.
     """
     with SessionLock():
         # Cancel young sessions and group-matched sessions before doing anything
@@ -909,11 +863,8 @@ def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_S
         if cancelled:
             print(f"⏭  Superseded: {', '.join(cancelled)}", file=sys.stderr)
 
-        sessions_context = build_sessions_context()
-        system = BOSS_SYSTEM_PROMPT.format(sessions_context=sessions_context)
-
         try:
-            raw = call_boss_llm(system, instruction)
+            raw = call_boss_llm(BOSS_SYSTEM_PROMPT, instruction)
         except Exception as e:
             print(f"Error calling boss LLM: {e}", file=sys.stderr)
             sys.exit(1)
@@ -930,22 +881,12 @@ def handle_instruction(instruction, group=None, debounce_secs=DEFAULT_DEBOUNCE_S
             print(f"Failed to parse boss response:\n{raw}\n\nError: {e}", file=sys.stderr)
             sys.exit(1)
 
-        action = decision.get('action', '')
         response = decision.get('response', '')
-
-        if action == 'start':
-            slug = slugify(decision.get('slug', 'task'))
-            prompt = decision.get('prompt', instruction) if refine else instruction
-            session_name = start_task(slug, prompt, group=group, cwd=cwd)
-            print(response)
-            print(f"\n📂 Session: {session_name}")
-
-        elif action == 'report':
-            print(response)
-
-        else:
-            print(f"Unknown action '{action}' from boss LLM. Raw:\n{raw}", file=sys.stderr)
-            sys.exit(1)
+        slug = slugify(decision.get('slug', 'task'))
+        prompt = decision.get('prompt', instruction) if refine else instruction
+        session_name = start_task(slug, prompt, group=group, cwd=cwd)
+        print(response)
+        print(f"\n📂 Session: {session_name}")
 
 # ---------------------------------------------------------------------------
 # Argument parsing
