@@ -1004,7 +1004,11 @@ def main():
     # instruction mode
     instruction = ' '.join(rest) if rest else None
     if not instruction and not sys.stdin.isatty():
-        instruction = sys.stdin.read().strip()
+        import select
+        # Only read stdin if data is already available (piped input).
+        # Avoids hanging when invoked over SSH without a PTY and no piped data.
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            instruction = sys.stdin.read().strip()
 
     if not instruction:
         print(__doc__.strip())
