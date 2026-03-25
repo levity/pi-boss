@@ -13,7 +13,7 @@ Usage:
     pi-boss status <pattern>                   # Filter to matching sessions
     pi-boss dump <pattern>                     # Dump session transcript
     pi-boss stop <pattern>                     # Cancel a running session
-    pi-boss append <pattern> "more instructions"  # Continue an existing session with new input
+    pi-boss append <pattern> "more instructions"  # Queue a follow-up for a running session
 
 Options:
     --group <id>              Group ID for supersede behavior (see below).
@@ -44,6 +44,8 @@ Concurrency & safety:
     check for cancellation and abort their pi instance promptly.
 """
 
+import threading
+import socket
 import sys
 import os
 import json
@@ -506,51 +508,154 @@ def run_worker(session_dir):
     proc.stdin.write(prompt_cmd + "\n")
     proc.stdin.flush()
 
+    # Unix socket for receiving follow-up instructions from the CLI.
+    # The socket thread accepts connections, reads a JSON line with the
+    # instruction, relays it to pi as a follow_up (queued if busy) or
+    # prompt (if agent is idle), and sends back an ack.
+    control_sock_path = session_dir / "control.sock"
+    control_sock_path.unlink(missing_ok=True)
+    agent_idle = threading.Event()  # set when agent is between runs
+    stop_control = threading.Event()
+
+    control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_sock.bind(str(control_sock_path))
+    control_sock.listen(4)
+    control_sock.settimeout(0.5)
+
+    def control_listener():
+        while not stop_control.is_set():
+            try:
+                conn, _ = control_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                data = b""
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                msg = json.loads(data.decode())
+                instruction = msg.get('instruction', '')
+                if instruction:
+                    if agent_idle.is_set():
+                        cmd = json.dumps({"type": "prompt", "message": instruction})
+                        agent_idle.clear()
+                    else:
+                        cmd = json.dumps({"type": "follow_up", "message": instruction})
+                    proc.stdin.write(cmd + "\n")
+                    proc.stdin.flush()
+                    conn.sendall(json.dumps({"ok": True}).encode())
+                else:
+                    conn.sendall(json.dumps({"ok": False, "error": "empty instruction"}).encode())
+            except Exception as e:
+                try:
+                    conn.sendall(json.dumps({"ok": False, "error": str(e)}).encode())
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+
+    control_thread = threading.Thread(target=control_listener, daemon=True)
+    control_thread.start()
+
+    import select as _select
+
+    # How long the worker waits after agent_end for a follow-up before
+    # shutting down.  While waiting, the control socket can still accept
+    # new instructions which reset the timer by sending a prompt to pi
+    # (which produces agent_start, clearing agent_idle).
+    IDLE_TIMEOUT_SECS = 30
+
     agent_done = False
+    cancelled = False
+    stdout_fd = proc.stdout.fileno()
+    buf = ""
     try:
         with open(events_path, 'a') as ef:
-            for line in proc.stdout:
-                # Check if we've been cancelled mid-run
-                current_meta = load_meta(session_dir)
-                if current_meta and current_meta.get('status') == 'cancelled':
+            while True:
+                # If the agent is idle (agent_end seen), only wait up to
+                # IDLE_TIMEOUT_SECS for more output.  If nothing arrives
+                # (no follow-up triggered a new agent_start), we exit.
+                timeout = IDLE_TIMEOUT_SECS if agent_idle.is_set() else None
+                readable, _, _ = _select.select([stdout_fd], [], [], timeout)
+
+                if not readable:
+                    # Timed out waiting for activity after agent_end.
+                    # Double-check that a follow-up didn't just arrive
+                    # (control thread clears agent_idle when sending a prompt).
+                    if not agent_idle.is_set():
+                        continue  # a prompt was just sent, keep going
+                    break
+
+                chunk = os.read(stdout_fd, 65536)
+                if not chunk:
+                    # pi closed stdout — process exiting
+                    break
+
+                buf += chunk.decode()
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Check if we've been cancelled mid-run
+                    current_meta = load_meta(session_dir)
+                    if current_meta and current_meta.get('status') == 'cancelled':
+                        try:
+                            abort_cmd = json.dumps({"type": "abort"})
+                            proc.stdin.write(abort_cmd + "\n")
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+                        cancelled = True
+                        break
+
+                    ef.write(line + "\n")
+                    ef.flush()
+
                     try:
-                        abort_cmd = json.dumps({"type": "abort"})
-                        proc.stdin.write(abort_cmd + "\n")
-                        proc.stdin.flush()
-                    except Exception:
-                        pass
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if evt.get('type') == 'agent_start':
+                        agent_idle.clear()
+                        agent_done = False
+
+                    if evt.get('type') == 'agent_end':
+                        agent_idle.set()
+                        agent_done = True
+                        # Don't break — wait for IDLE_TIMEOUT_SECS in case
+                        # a follow-up arrives via the control socket.
+
+                    if evt.get('type') == 'extension_ui_request':
+                        method = evt.get('method', '')
+                        eid = evt.get('id', '')
+                        if method in ('select', 'confirm', 'input', 'editor'):
+                            cancel = json.dumps({
+                                "type": "extension_ui_response",
+                                "id": eid,
+                                "cancelled": True
+                            })
+                            proc.stdin.write(cancel + "\n")
+                            proc.stdin.flush()
+
+                if cancelled:
                     break
-
-                line = line.strip()
-                if not line:
-                    continue
-                ef.write(line + "\n")
-                ef.flush()
-
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if evt.get('type') == 'agent_end':
-                    agent_done = True
-                    break
-
-                if evt.get('type') == 'extension_ui_request':
-                    method = evt.get('method', '')
-                    eid = evt.get('id', '')
-                    if method in ('select', 'confirm', 'input', 'editor'):
-                        cancel = json.dumps({
-                            "type": "extension_ui_response",
-                            "id": eid,
-                            "cancelled": True
-                        })
-                        proc.stdin.write(cancel + "\n")
-                        proc.stdin.flush()
 
     except Exception as e:
         with open(session_dir / "worker_error.log", 'w') as f:
             f.write(str(e))
+
+    # Stop the control socket listener
+    stop_control.set()
+    control_sock.close()
+    control_thread.join(timeout=2)
+    control_sock_path.unlink(missing_ok=True)
 
     try:
         proc.stdin.close()
@@ -780,7 +885,14 @@ def stop_session(pattern):
 # ---------------------------------------------------------------------------
 
 def append_session(pattern, instruction):
-    """Resume an existing session with a new instruction."""
+    """Send a follow-up instruction to a running session via its control socket.
+
+    If the session is running, the instruction is queued as a follow_up (delivered
+    after the agent's current work) or as a prompt (if the agent is idle between
+    tasks). Either way the CLI gets a synchronous ack.
+
+    If the session is not running, prints an error and exits.
+    """
     sessions = get_all_sessions()
     matched = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
 
@@ -796,35 +908,43 @@ def append_session(pattern, instruction):
 
     s = matched[0]
     name = s.get('_name', '?')
-    status = get_session_status(s)
-    session_dir = s['_dir']
+    session_dir = Path(s['_dir'])
+    control_sock_path = session_dir / "control.sock"
 
-    if status in ('running', 'starting'):
-        print(f"{name}: still running, stop it first", file=sys.stderr)
+    if not control_sock_path.exists():
+        status = get_session_status(s)
+        print(f"{name}: session is not running ({status}), cannot append.", file=sys.stderr)
         sys.exit(1)
 
-    # Set the prompt and resuming flag for the worker to pick up
-    meta = load_meta(session_dir)
-    meta['prompt'] = instruction
-    meta['resuming'] = True
-    meta['status'] = 'starting'
-    meta['finished_at'] = None
-    meta['exit_code'] = None
-    save_meta(session_dir, meta)
-
-    worker_cmd = ["uv", "run", __file__, "--worker", str(session_dir)]
-    proc = subprocess.Popen(
-        worker_cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=open(Path(session_dir) / "worker_stdout.log", 'a'),
-        stderr=open(Path(session_dir) / "worker_stderr.log", 'a'),
-        start_new_session=True,
-    )
-
-    meta['worker_pid'] = proc.pid
-    save_meta(session_dir, meta)
-
-    print(f"{name}: appended, resuming")
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(str(control_sock_path))
+        sock.sendall(json.dumps({"instruction": instruction}).encode())
+        sock.shutdown(socket.SHUT_WR)  # signal end of request
+        resp_data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp_data += chunk
+        sock.close()
+        resp = json.loads(resp_data.decode())
+        if resp.get('ok'):
+            print(f"{name}: follow-up queued")
+        else:
+            print(f"{name}: error: {resp.get('error', 'unknown')}", file=sys.stderr)
+            sys.exit(1)
+    except ConnectionRefusedError:
+        print(f"{name}: session worker is not running (stale socket).", file=sys.stderr)
+        control_sock_path.unlink(missing_ok=True)
+        sys.exit(1)
+    except socket.timeout:
+        print(f"{name}: timed out connecting to session worker.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"{name}: failed to send follow-up: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Main instruction handler
