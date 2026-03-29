@@ -884,14 +884,49 @@ def stop_session(pattern):
 # Append to a session
 # ---------------------------------------------------------------------------
 
+def _send_via_socket(control_sock_path, instruction):
+    """Try to send an instruction via the control socket.
+
+    Returns True if delivered, False if the socket doesn't exist or the
+    worker isn't reachable (stale socket, connection refused, etc.).
+    Raises on unexpected errors.
+    """
+    if not control_sock_path.exists():
+        return False
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(str(control_sock_path))
+        sock.sendall(json.dumps({"instruction": instruction}).encode())
+        sock.shutdown(socket.SHUT_WR)
+        resp_data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp_data += chunk
+        sock.close()
+        resp = json.loads(resp_data.decode())
+        if resp.get('ok'):
+            return True
+        raise RuntimeError(resp.get('error', 'unknown error from worker'))
+    except (ConnectionRefusedError, FileNotFoundError):
+        control_sock_path.unlink(missing_ok=True)
+        return False
+    except socket.timeout:
+        return False
+
+
 def append_session(pattern, instruction):
-    """Send a follow-up instruction to a running session via its control socket.
+    """Send a follow-up instruction to an existing session.
 
-    If the session is running, the instruction is queued as a follow_up (delivered
-    after the agent's current work) or as a prompt (if the agent is idle between
-    tasks). Either way the CLI gets a synchronous ack.
+    If the session is running, the instruction is delivered via the control
+    socket — queued as a follow_up (if the agent is busy) or sent as a
+    prompt (if the agent is idle between tasks).
 
-    If the session is not running, prints an error and exits.
+    If the session is not running, a new worker is spawned with pi's
+    --session flag to resume the conversation history.
     """
     sessions = get_all_sessions()
     matched = [s for s in sessions if pattern in s.get('_name', '') or pattern in s.get('task', '')]
@@ -911,40 +946,42 @@ def append_session(pattern, instruction):
     session_dir = Path(s['_dir'])
     control_sock_path = session_dir / "control.sock"
 
-    if not control_sock_path.exists():
-        status = get_session_status(s)
-        print(f"{name}: session is not running ({status}), cannot append.", file=sys.stderr)
+    # Try the live socket first (running session)
+    try:
+        if _send_via_socket(control_sock_path, instruction):
+            print(f"{name}: follow-up queued")
+            return
+    except RuntimeError as e:
+        print(f"{name}: error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect(str(control_sock_path))
-        sock.sendall(json.dumps({"instruction": instruction}).encode())
-        sock.shutdown(socket.SHUT_WR)  # signal end of request
-        resp_data = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            resp_data += chunk
-        sock.close()
-        resp = json.loads(resp_data.decode())
-        if resp.get('ok'):
-            print(f"{name}: follow-up queued")
-        else:
-            print(f"{name}: error: {resp.get('error', 'unknown')}", file=sys.stderr)
-            sys.exit(1)
-    except ConnectionRefusedError:
-        print(f"{name}: session worker is not running (stale socket).", file=sys.stderr)
-        control_sock_path.unlink(missing_ok=True)
+    # Session is not running — resume it with a new worker
+    session_file = find_session_jsonl(session_dir)
+    if not session_file:
+        print(f"{name}: no session file to resume.", file=sys.stderr)
         sys.exit(1)
-    except socket.timeout:
-        print(f"{name}: timed out connecting to session worker.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"{name}: failed to send follow-up: {e}", file=sys.stderr)
-        sys.exit(1)
+
+    meta = load_meta(session_dir)
+    meta['prompt'] = instruction
+    meta['resuming'] = True
+    meta['status'] = 'starting'
+    meta['finished_at'] = None
+    meta['exit_code'] = None
+    save_meta(session_dir, meta)
+
+    worker_cmd = ["uv", "run", __file__, "--worker", str(session_dir)]
+    proc = subprocess.Popen(
+        worker_cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=open(session_dir / "worker_stdout.log", 'a'),
+        stderr=open(session_dir / "worker_stderr.log", 'a'),
+        start_new_session=True,
+    )
+
+    meta['worker_pid'] = proc.pid
+    save_meta(session_dir, meta)
+
+    print(f"{name}: resuming session")
 
 # ---------------------------------------------------------------------------
 # Main instruction handler
